@@ -1,9 +1,6 @@
 """Utilities for converting annotations. Clear of cloud-specific things."""
 import logging
-from os import PathLike
-import multiprocessing as mp
-from typing import Iterable, Tuple, Union
-
+from typing import Tuple, Union
 import highdicom as hd
 import numpy as np
 import pandas as pd
@@ -11,28 +8,24 @@ from pydicom import Dataset
 from pydicom.sr.codedict import codes
 from shapely.geometry.polygon import Polygon
 
-
 from idc_annotation_conversion.pan_cancer_nuclei_seg import metadata_config
 
 
-def process_csv_row(
-    csv_row: pd.Series,
+def process_df_row(
+    df_row: pd.Series,
     transformer: hd.spatial.ImageToReferenceTransformer,
-    area_per_pixel_um2: float,
     graphic_type: hd.ann.GraphicTypeValues = hd.ann.GraphicTypeValues.POLYGON,
     annotation_coordinate_type: hd.ann.AnnotationCoordinateTypeValues = hd.ann.AnnotationCoordinateTypeValues.SCOORD,  # noqa: E501
 ) -> Union[Tuple[Polygon, np.ndarray, float], Tuple[None, None, None]]:
-    """Process a single annotation CSV file.
+    """Process a single annotation.
 
     Parameters
     ----------
-    csv_row: pd.Series
-        Single row of a loaded annotation CSV.
+    df_row: pd.Series
+        Single row of the dataframe containing the annotations.
     transformer: hd.spatial.ImageToReferenceTransformer
         Transformer object to map image coordinates to reference coordinates
         for the image.
-    area_per_pixel_um2: float
-        Area of each pixel in square micrometers.
     graphic_type: highdicom.ann.GraphicTypeValues, optional
         Graphic type to use to store all nuclei. Note that all but 'POLYGON'
         result in simplification and loss of information in the annotations.
@@ -50,17 +43,16 @@ def process_csv_row(
     graphic_data: np.ndarray
         Numpy array of float32 coordinates to include in the Bulk Microscopy
         Simple Annotations.
-    area: float
-        Area measurement of this polygon. Note that this is always the area of
-        the full original polygon regardless of the requested graphic type.
+    identifier: int 
+        Identifier for each annotation taken as is from input. 
 
-    """  # noqa: E501
+    """  
+    # TODO: 
     points = np.array(
         csv_row.Polygon[1:-1].split(':'),
         dtype=np.float32
     )
-    area_pix = float(csv_row.AreaInPixels)
-    area_um2 = area_pix * area_per_pixel_um2
+    
     n = len(points) // 2
     if points.shape[0] < 6 or (points.shape[0] % 2) == 1:
         return None, None, None
@@ -124,7 +116,7 @@ def process_csv_row(
             graphic_data = graphic_data[[2, 3, 0, 1], :]
     else:
         raise ValueError(
-            f"Graphic type '{graphic_type.value}' not supported."
+            f'Graphic type '{graphic_type.value}' not supported.'
         )
 
     use_3d = (
@@ -134,37 +126,11 @@ def process_csv_row(
     if use_3d:
         graphic_data = transformer(graphic_data)
 
-    return polygon_image, graphic_data.astype(np.float32), area_um2
-
-
-def pool_init(
-    transformer: hd.spatial.ImageToReferenceTransformer,
-    area_per_pixel_um2: float,
-    graphic_type: hd.ann.GraphicTypeValues,
-    annotation_coordinate_type: hd.ann.AnnotationCoordinateTypeValues = hd.ann.AnnotationCoordinateTypeValues.SCOORD,  # noqa: E501
-):
-    global transformer_global
-    transformer_global = transformer
-    global area_per_pixel_um2_global
-    area_per_pixel_um2_global = area_per_pixel_um2
-    global graphic_type_global
-    graphic_type_global = graphic_type
-    global annotation_coordinate_type_global
-    annotation_coordinate_type_global = annotation_coordinate_type
-
-
-def pool_fun(csv_row: pd.Series):
-    return process_csv_row(
-        csv_row,
-        transformer_global,
-        area_per_pixel_um2_global,
-        graphic_type_global,
-        annotation_coordinate_type_global,
-    )
+    return polygon_image, graphic_data.astype(np.float32), df_row['cell_id']
 
 
 def get_graphic_data(
-    annotation_csvs: Iterable[Union[str, PathLike]],
+    annotations: pd.DataFrame,
     source_image_metadata: Dataset,
     graphic_type: Union[
         hd.ann.GraphicTypeValues,
@@ -174,15 +140,14 @@ def get_graphic_data(
         hd.ann.AnnotationCoordinateTypeValues,
         str
     ] = hd.ann.AnnotationCoordinateTypeValues.SCOORD,
-    workers: int = 0,
 ) -> tuple[list[Polygon], list[np.ndarray], list[float]]:
-    """Parse CSV file to construct graphic data to use in annotations.
+    """Parse annotations to construct graphic data.
 
     Parameters
     ----------
-    annotation_csvs: Iterable[Union[str, os.PathLike]]
-        Iterable over pathlike objects, each representing the path to a
-        CSV-format file containing an annotation for this image.
+    annotations: pd.DataFrame
+        Dataframe containing at least following columns
+        # TODO 
     source_image_metadata: pydicom.Dataset
         Pydicom datasets containing the metadata of the image (already
         converted to DICOM format). Note that this should be the metadata of
@@ -196,9 +161,6 @@ def get_graphic_data(
         Store coordinates in the Bulk Microscopy Bulk Simple Annotations in the
         (3D) frame of reference (SCOORD3D), or the (2D) total pixel matrix
         (SCOORD, default).
-    workers: int
-        Number of subprocess workers to spawn. If 0, all computation will use
-        the main thread.
 
     Returns
     -------
@@ -210,11 +172,10 @@ def get_graphic_data(
         List of graphic data as numpy arrays in the format required for the
         MicroscopyBulkSimpleAnnotations object. These are correctly formatted
         for the requested graphic type and annotation coordinate type.
-    areas: list[float]
-        Areas for each of the polygons, in square micrometers. Does not depend
+    identifier: list[int]
+        Identifiers for each annotation taken as is from input. Does not depend
         on requested graphic type or coordinate type.
-
-    """  # noqa: E501
+    """  
     graphic_type = hd.ann.GraphicTypeValues[graphic_type]
     annotation_coordinate_type = hd.ann.AnnotationCoordinateTypeValues[
         annotation_coordinate_type
@@ -224,73 +185,32 @@ def get_graphic_data(
         source_image_metadata,
         for_total_pixel_matrix=True,
     )
-    pixel_spacing = (
-        source_image_metadata.SharedFunctionalGroupsSequence[0]
-        .PixelMeasuresSequence[0]
-        .PixelSpacing
-    )
-    area_per_pixel_um2 = pixel_spacing[0] * pixel_spacing[1] * 1e6
 
     if graphic_type == hd.ann.GraphicTypeValues.POLYLINE:
-        raise ValueError("Graphic type 'POLYLINE' not supported.")
+        raise ValueError('Graphic type 'POLYLINE' not supported.')
 
-    if workers > 0:
-        # Use multiprcocessing
-        # Read in all CSVs using threads
-        logging.info("Reading CSV files.")
-        all_dfs = [pd.read_csv(f) for f in annotation_csvs]
+    graphic_data = []
+    polygons = []
+    areas = []
 
-        # Join CSVs and process each row in parallel
-        df = pd.concat(all_dfs, ignore_index=True)
-        logging.info(f"Found {len(df)} annotations.")
+    for df_row in annotations.iterrows():
+        polygon, graphic_item, area = process_df_row(
+            df_row,
+            transformer,
+            area_per_pixel_um2,
+            graphic_type,
+            annotation_coordinate_type,
+        )
 
-        input_data = [row for _, row in df.iterrows()]
+        if polygon is None:
+            continue
 
-        with mp.Pool(
-            workers,
-            initializer=pool_init,
-            initargs=(
-                transformer,
-                area_per_pixel_um2,
-                graphic_type,
-                annotation_coordinate_type,
-            )
-        ) as pool:
-            results = pool.map(
-                pool_fun,
-                input_data,
-            )
+        graphic_data.append(graphic_item)
+        polygons.append(polygon)
 
-        results = [r for r in results if r[0] is not None]  # remove failures
+        areas.append(area)
 
-        polygons, graphic_data, areas = zip(*results)
-
-    else:
-        # Use the main thread
-        graphic_data = []
-        polygons = []
-        areas = []
-        for f in annotation_csvs:
-            df = pd.read_csv(f)
-
-            for _, csv_row in df.iterrows():
-                polygon, graphic_item, area = process_csv_row(
-                    csv_row,
-                    transformer,
-                    area_per_pixel_um2,
-                    graphic_type,
-                    annotation_coordinate_type,
-                )
-
-                if polygon is None:
-                    continue
-
-                graphic_data.append(graphic_item)
-                polygons.append(polygon)
-
-                areas.append(area)
-
-    logging.info(f"Parsed {len(graphic_data)} annotations.")
+    logging.info(f'Parsed {len(graphic_data)} annotations.')
 
     return polygons, graphic_data, areas
 
@@ -339,6 +259,7 @@ def create_bulk_annotations(
         annotation_coordinate_type
     ]
 
+    # TODO: for loop for the different possible labels
     group = hd.ann.AnnotationGroup(
         number=1,
         uid=hd.UID(),

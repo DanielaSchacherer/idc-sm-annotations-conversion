@@ -3,30 +3,37 @@ import os
 import datetime
 import pydicom 
 import logging
+import pandas as pd
 from pathlib import Path
 from time import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
-import highdicom as hd
-import pandas as pd
-
-#from idc_annotation_conversion.pan_cancer_nuclei_seg.convert import (
-#    get_graphic_data,
-#    create_bulk_annotations,
-#)
-#from idc_annotation_conversion.mp_utils import Pipeline
+from idc_annotation_conversion.pan_cancer_nuclei_seg.convert import (
+    get_graphic_data,
+    create_bulk_annotations,
+)
 
 ANNOTATION_PREFIX = 'cnn-nuclear-segmentations-2019/data-files/'
 
-# could be written as class as well
-def preprocess_annotation_csvs(annotation_csv: Path, roi_csv: Path) -> pd.DataFrame: 
-    annotations = pd.read_csv(annotation_csv)
-    rois = pd.read_csv(roi_csv)
-    print(annotations.head())
-    print(rois.head())
+def preprocess_annotation_csvs(cells_csv: Path, roi_csv: Path) -> pd.DataFrame: 
+    """ 
+    Function to massage the annotation data to fit the required format for the conversion process.
+    """
 
-def filter_annotations(annotations: pd.DataFrame, slide_id: str) -> pd.DataFrame: 
-    pass 
+    cells = pd.read_csv(cells_csv)
+    rois = pd.read_csv(roi_csv)
+    return pd.merge(cells, rois[['id', 'slide_id']], 
+                    left_on='rocellboxing_id', 
+                    right_on = 'id', 
+                    how='left').drop('id', axis=1)
+
+
+def filter_cell_annotations(annotations: pd.DataFrame, slide_id: str) -> pd.DataFrame: 
+    """ 
+    Function to filter for annotations of a single slide.
+    """
+    return annotations[annotations['slide_id'] == slide_id] 
+
 
 def get_source_image_metadata(slide_dir: Path) -> Dict[str, Any]: 
     """ 
@@ -67,15 +74,6 @@ def get_source_image_metadata(slide_dir: Path) -> Dict[str, Any]:
     return data 
 
 
-def get_ann_file_name(
-    output_root: str,
-    slide_id: str, 
-    suffix: str
-) -> str:
-    """Get the name of the file where an annotation should be stored."""
-    return Path(f'{output_root}{slide_id}/{slide_id}_ann_{suffix}.dcm')
-
-
 class AnnotationParser:
 
     """Class that parses CSV annotations to graphic data."""
@@ -83,7 +81,8 @@ class AnnotationParser:
     def __init__(
         self,
         annotation_coordinate_type: str,
-        graphic_type: str
+        graphic_type: str, 
+        output_dir: Path
     ):
         """
 
@@ -97,10 +96,13 @@ class AnnotationParser:
             Graphic type to use to store all nuclei. Note that all but
             'POLYGON' result in simplification and loss of information in the
             annotations.
+        output_dir: pathlib.Path
+            A local output directory to store error logs.
 
         """
         self._annotation_coordinate_type = annotation_coordinate_type
         self._graphic_type = graphic_type
+        self._output_dir = output_dir
         self._errors = []
 
     def __call__(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -141,7 +143,7 @@ class AnnotationParser:
         logging.info(f'Parsing annotations for slide: {slide_id}')
         try:
             polygons, graphic_data, identifiers = get_graphic_data(
-                annotation_csvs='tbd',
+                annotations='tbd',
                 source_image_metadata=data['source_image'],
                 graphic_type=self._graphic_type,
                 annotation_coordinate_type=self._annotation_coordinate_type,
@@ -157,7 +159,7 @@ class AnnotationParser:
                 }
             )
             errors_df = pd.DataFrame(self._errors)
-            errors_df.to_csv('conversion_error_log.csv')
+            errors_df.to_csv(self._output_dir / 'conversion_error_log.csv')
             return None
 
         stop_time = time()
@@ -180,6 +182,7 @@ class AnnotationCreator:
         self,
         graphic_type: str,
         annotation_coordinate_type: str,
+        output_dir: Path
     ):
         """
 
@@ -193,11 +196,15 @@ class AnnotationCreator:
             Store coordinates in the Bulk Microscopy Bulk Simple Annotations in
             the (3D) frame of reference (SCOORD3D), or the (2D) total pixel
             matrix (SCOORD, default).
+        output_dir: pathlib.Path
+            A local output directory to store error logs.
 
         """
         self._annotation_coordinate_type = annotation_coordinate_type
         self._graphic_type = graphic_type
+        self._output_dir = output_dir
         self._errors = []
+
 
     def __call__(self, data: dict[str, Any]) -> dict[str, Any]:
         """Parse CSV to graphic data.
@@ -260,7 +267,7 @@ class AnnotationCreator:
                 }
             )
             errors_df = pd.DataFrame(self._errors)
-            errors_df.to_csv("annotation_creator_error_log.csv")
+            errors_df.to_csv(self._output_dir / 'annotation_creator_error_log.csv')
             return None
 
         stop_time = time()
@@ -278,302 +285,75 @@ class AnnotationCreator:
         return data
 
 
-# FileSaver
-class FileUploader:
+class AnnotationSaver:
 
     def __init__(
         self,
-        output_bucket_obj: Optional[storage.Bucket],
-        output_blob_root: str,
-        output_dir: Optional[Path],
-        dicom_archive: Optional[str] = None,
-        archive_token_url: Optional[str] = None,
-        archive_client_id: Optional[str] = None,
-        archive_client_secret: Optional[str] = None,
+        output_dir: Path,
     ):
         """
 
         Parameters
         ----------
-        output_bucket_obj: Optional[google.storage.Bucket]
-            Output bucket, if storing in a bucket.
-        output_dir: Optional[pathlib.Path]
-            A local output directory to store a copy of the downloaded files
-            in, if required.
-        dicom_archive: Optional[str], optional
-            Additionally store images to this DICOM archive.
-        archive_token_url: Optional[str], optional
-            URL to use to request an OAuth token to access the archive.,
-        archive_client_id: Optional[str], optional
-            Client ID to use for OAuth token request.,
-        archive_client_secret: Optional[str], optional
-            Client secret to use for OAuth token request. If none, user will
-            be prompted for secret.
+        output_dir: pathlib.Path
+            A local output directory to store the downloaded files.
 
         """
-        self._output_bucket_obj = output_bucket_obj
-        self._output_blob_root = output_blob_root
+
         self._output_dir = output_dir
-        self._dicom_archive = dicom_archive
-        self._archive_token_url = archive_token_url
-        self._archive_client_id = archive_client_id
-        self._archive_client_secret = archive_client_secret
         self._errors = []
 
     def __call__(
         self,
         data: dict[str, Any],
     ) -> None:
-        """Upload files.
+        """Store files.
 
         Parameters
         ----------
         data: dict[str, Any]
             Input data packed into a dictionary, containing at least:
 
-            - collection: str
-                Collection name for the case.
-            - container_id: str
-                Container ID for the case.
+            - slide_id: str
+                Slide ID for the case.
             - ann_dcm: highdicom.ann.MicroscopyBulkSimpleAnnotations
                 Bulk Annotation DICOM object.
-            - seg_dcm: Optional[list[highdicom.seg.Segmentation]]
-                Converted segmentations, if required.
 
         """
         image_start_time = time()
 
         # Unpack inputs
-        collection = data["collection"]
-        container_id = data["container_id"]
-        ann_dcm = data["ann_dcm"]
-        seg_dcms = data.get("seg_dcms")
+        slide_id = data['slide_id']
+        ann_dcm = data['ann_dcm']
 
-        logging.info(f"Uploading annotations for {container_id}")
-
-        if self._output_dir is not None:
-            collection_dir = self._output_dir / collection
-            collection_dir.mkdir(exist_ok=True)
+        logging.info(f'Saving annotations for slide {slide_id}')
+        
+        slide_ann_dir = self._output_dir / slide_id
+        slide_ann_dir.mkdir(exist_ok=True)
 
         try:
-            # Store objects to filesystem
-            if self._output_dir is not None:
-                ann_path = collection_dir / f"{container_id}_ann.dcm"
-
-                logging.info(f"Writing annotation to {str(ann_path)}.")
-                ann_dcm.save_as(ann_path)
-
-                if seg_dcms is not None:
-                    for s, seg_dcm in enumerate(seg_dcms):
-                        seg_path = (
-                            collection_dir / f"{container_id}_seg_{s}.dcm"
-                        )
-                        logging.info(
-                            f"Writing segmentation to {str(seg_path)}."
-                        )
-                        seg_dcm.save_as(seg_path)
+            ann_path = f'{slide_ann_dir}/{slide_id}_ann_{suffix}.dcm'
+            logging.info(f'Writing annotation to {str(ann_path)}.')
+            ann_dcm.save_as(ann_path)
 
             image_stop_time = time()
             time_for_image = image_stop_time - image_start_time
             logging.info(
-                f"Uploaded annotations for {container_id} in "
-                f"{time_for_image:.2f}s"
+                f'Saved annotations for slide {slide_id} in {time_for_image:.2f}s'
             )
             
         except Exception as e:
             logging.error(f"Error {str(e)}")
             self._errors.append(
                 {
-                    "collection": collection,
-                    "container_id": container_id,
-                    "error_message": str(e),
-                    "datetime": str(datetime.datetime.now()),
+                    'slide_id': data['slide_id'],
+                    'error_message': str(e),
+                    'datetime': str(datetime.datetime.now()),
                 }
             )
             errors_df = pd.DataFrame(self._errors)
-            errors_df.to_csv("upload_error_log.csv")
+            errors_df.to_csv(self._output_dir / 'upload_error_log.csv')
             return None
-
-
-@click.command()
-@click.option(
-    "-c",
-    "--collections",
-    multiple=True,
-    type=click.Choice(COLLECTIONS),
-    help="Collections to use, all by default.",
-    show_choices=True,
-)
-@click.option(
-    "-l",
-    "--csv-blob",
-    help=(
-        "Specify a single CSV blob to process, using its path within "
-        "the bucket."
-    ),
-)
-@click.option(
-    "-f",
-    "--blob-filter",
-    help=(
-        "Only process annotations blobs whose name contains this string."
-    ),
-)
-@click.option(
-    "--number",
-    "-n",
-    type=int,
-    help="Number of annotations to process. All by default.",
-)
-@click.option(
-    "--output-dir",
-    "-o",
-    type=click.Path(path_type=Path, file_okay=False),
-    help="Output directory, default: no output directory",
-)
-@click.option(
-    "--output-bucket",
-    "-b",
-    help="Output bucket",
-    show_default=True,
-)
-@click.option(
-    "--store-bucket/--no-store-bucket",
-    "-k/-K",
-    help="Whether to store outputs to the bucket in this run.",
-    default=True,
-    show_default=True,
-)
-@click.option(
-    "--keep-existing/--overwrite-existing",
-    "-m/-M",
-    help="Only process a case if the output does not exist in the bucket.",
-    default=False,
-    show_default=True,
-)
-@click.option(
-    "--output-prefix",
-    "-p",
-    help="Prefix for all output blobs. Default no prefix.",
-)
-@click.option(
-    "--graphic-type",
-    "-g",
-    default="POLYGON",
-    type=click.Choice(
-        [v.name for v in hd.ann.GraphicTypeValues],
-        case_sensitive=False,
-    ),
-    show_default=True,
-    help=(
-        "Graphic type to use to store all nuclei. Note that all "
-        "but 'POLYGON' result in simplification and loss of "
-        "information in the annotations."
-    ),
-)
-@click.option(
-    "--store-wsi-dicom/--no-store-wsi-dicom",
-    "-d/-D",
-    default=False,
-    show_default=True,
-    help=(
-        "Download all WSI DICOM files and store in the output directory "
-        "(if any)."
-    ),
-)
-@click.option(
-    "--annotation-coordinate-type",
-    "-a",
-    type=click.Choice(
-        [v.name for v in hd.ann.AnnotationCoordinateTypeValues],
-        case_sensitive=False,
-    ),
-    default="SCOORD",
-    show_default=True,
-    help=(
-        "Coordinate type for points stored in the microscopy annotations. "
-        "SCOORD: 2D, SCOORD3D: 3D."
-    ),
-)
-@click.option(
-    "--dimension-organization-type",
-    "-T",
-    type=click.Choice(
-        [v.name for v in hd.DimensionOrganizationTypeValues],
-        case_sensitive=False,
-    ),
-    default="TILED_FULL",
-    show_default=True,
-    help=(
-        "Dimension organization type for segmentations. TILED_FULL (default) "
-        "or TILED_SPARSE."
-    ),
-)
-@click.option(
-    "--with-segmentation/--without-segmentation",
-    "-s/-S",
-    default=True,
-    show_default=True,
-    help="Include a segmentation image in the output.",
-)
-@click.option(
-    "--create-pyramid/--no-create-pyramid",
-    "-q/-Q",
-    default=True,
-    show_default=True,
-    help="Create a full segmentation pyramid series.",
-)
-@click.option(
-    "--segmentation-type",
-    "-t",
-    type=click.Choice(
-        [v.name for v in hd.seg.SegmentationTypeValues],
-        case_sensitive=False,
-    ),
-    default="BINARY",
-    show_default=True,
-    help="Segmentation type for the Segmentation Image, if any.",
-)
-@click.option(
-    "--dicom-archive",
-    "-x",
-    help="Additionally store outputs to this DICOM archive.",
-)
-@click.option(
-    "--archive-token-url",
-    "-u",
-    help="URL to use to request an OAuth token to access the archive.",
-)
-@click.option(
-    "--archive-client-id",
-    "-i",
-    help="Client ID to use for OAuth token request.",
-)
-@click.option(
-    "--archive-client-secret",
-    "-y",
-    help=(
-        "Client secret to use for OAuth token request. If none, user will "
-        "be prompted for secret."
-    )
-)
-@click.option(
-    "--workers",
-    "-w",
-    type=int,
-    default=0,
-    help=(
-        "Number of subprocesses for CSV parsing to use. If 0, the main thread "
-        "is used."
-    ),
-)
-@click.option(
-    "--pull-process/--no-pull-process",
-    "-r/-R",
-    default=True,
-    show_default=True,
-    help="Use a separate process to pull images.",
-)
 
 
 def run(
@@ -589,8 +369,8 @@ def run(
     logging.basicConfig(level=logging.INFO)
 
     # Suppress highdicom logging (very talkative)
-    logging.getLogger("highdicom.base").setLevel(logging.WARNING)
-    logging.getLogger("highdicom.seg.sop").setLevel(logging.WARNING)
+    logging.getLogger('highdicom.base').setLevel(logging.WARNING)
+    logging.getLogger('highdicom.seg.sop').setLevel(logging.WARNING)
     
     if output_dir is not None:
         output_dir.mkdir(exist_ok=True)
@@ -612,15 +392,15 @@ def run(
     upload_kwargs = dict(
     )
     operations.append((FileUploader, [], upload_kwargs))
-    pipeline = Pipeline(
-        operations,
-        same_process=not pull_process,
-    )
-    pipeline(to_process)
+    #pipeline = Pipeline(
+    #    operations,
+    #    same_process=not pull_process,
+    #)
+    #pipeline(to_process)
 
 
 if __name__ == "__main__":
-    sim = get_source_image_metadata(Path('/home/dschacherer/bmdeep_conversion/data/bmdeep_DICOM_converted/'))
-    print(sim)
-    preprocess_annotation_csvs(Path('/home/dschacherer/bmdeep_conversion/data/cells.csv'),
+    sim = get_source_image_metadata(Path('/home/dschacherer/bmdeep_conversion/data/bmdeep_DICOM_converted/E2C0BE24560D78C5E599C2A9C9D0BBD2_1_bm'))
+    res = preprocess_annotation_csvs(Path('/home/dschacherer/bmdeep_conversion/data/cells.csv'),
                                Path('/home/dschacherer/bmdeep_conversion/data/rois.csv'))
+    print(filter_cell_annotations(res, 'F7177163C833DFF4B38FC8D2872F1EC6_1_bm'))

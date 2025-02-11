@@ -2,16 +2,13 @@
 import logging
 from os import PathLike
 import multiprocessing as mp
-from time import time
-from typing import Iterable, Sequence, Tuple, Union
+from typing import Iterable, Tuple, Union
 
 import highdicom as hd
 import numpy as np
 import pandas as pd
 from pydicom import Dataset
 from pydicom.sr.codedict import codes
-from pydicom.uid import JPEGLSLossless, ExplicitVRLittleEndian
-from rasterio.features import rasterize
 from shapely.geometry.polygon import Polygon
 
 
@@ -376,131 +373,3 @@ def create_bulk_annotations(
     annotations.add(metadata_config.other_trials_seq_element)
 
     return annotations
-
-def create_segmentations(
-    polygons: list[Polygon],
-    source_images: Sequence[Dataset],
-    *,
-    segmentation_type: Union[
-        hd.seg.SegmentationTypeValues,
-        str
-    ] = hd.seg.SegmentationTypeValues.BINARY,
-    dimension_organization_type: hd.DimensionOrganizationTypeValues = hd.DimensionOrganizationTypeValues.TILED_FULL,  # noqa: E501
-    create_pyramid: bool = True,
-) -> list[hd.seg.Segmentation]:
-    """Convert an annotation into DICOM format.
-
-    Specifically, a Bulk Microscopy Simple Annotation object (vector
-    graphics) is created and a Segmentation Image (raster) is optionally
-    created.
-
-    Parameters
-    ----------
-    polygons: list[shapely.geometry.polygon.Polygon]
-        List of precomputed polygons.
-    source_images: Sequence[pydicom.Dataset]
-        List of pydicom datasets containing the metadata of the image (already
-        converted to DICOM format). Note that the metadata of the image at full
-        resolution should appear first in this list. These can be the full image
-        datasets, but the PixelData attributes are not required.
-    segmentation_type: Union[hd.seg.SegmentationTypeValues, str], optional
-        Segmentation type (BINARY or FRACTIONAL) for the Segmentation Image
-        (if any).
-    dimension_organization_type: Union[hd.DimensionOrganizationTypeValues, str], optional
-        Dimension organization type of the output segmentations.
-    create_pyramid: bool, optional
-        Whether to create a full pyramid of segmentations (rather than a single
-        segmentation at the highest resolution).
-
-    Returns
-    -------
-    segmentations: list[hd.seg.Segmentation]
-        DICOM segmentation image(s) encoding the original annotations in raster
-        format.
-
-    """  # noqa: E501
-    segmentation_type = hd.seg.SegmentationTypeValues[segmentation_type]
-    dimension_organization_type = hd.DimensionOrganizationTypeValues[
-        dimension_organization_type
-    ]
-    source_image_metadata = source_images[0]
-
-    logging.info("Rasterizing segmentation.")
-    mask_shape = (
-        source_image_metadata.TotalPixelMatrixRows,
-        source_image_metadata.TotalPixelMatrixColumns,
-    )
-    raster_start_time = time()
-    segmentation_mask = rasterize(polygons, mask_shape, dtype=np.uint8)
-    raster_time = time() - raster_start_time
-    logging.info(f"Completed rasterization in {raster_time:.1f}s.")
-
-    logging.info("Creating DICOM segmentation image.")
-
-    segment_description = hd.seg.SegmentDescription(
-        segment_number=1,
-        segment_label=metadata_config.label,
-        segmented_property_category=metadata_config.finding_category,
-        segmented_property_type=metadata_config.finding_type,
-        algorithm_type=hd.seg.SegmentAlgorithmTypeValues.AUTOMATIC,
-        algorithm_identification=metadata_config.algorithm_identification
-    )
-
-    # Compression method depends on what is possible given the chosen
-    # segmentation type
-    transfer_syntax_uid = {
-        hd.seg.SegmentationTypeValues.BINARY: ExplicitVRLittleEndian,
-        hd.seg.SegmentationTypeValues.FRACTIONAL: JPEGLSLossless,
-    }[segmentation_type]
-
-    omit_empty_frames = dimension_organization_type.value != "TILED_FULL"
-
-    if create_pyramid:
-        seg_start_time = time()
-        segmentations = hd.seg.pyramid.create_segmentation_pyramid(
-            source_images=source_images,
-            pixel_arrays=[segmentation_mask],
-            segmentation_type=segmentation_type,
-            segment_descriptions=[segment_description],
-            series_instance_uid=hd.UID(),
-            series_number=20,
-            manufacturer=metadata_config.manufacturer,
-            manufacturer_model_name=metadata_config.manufacturer_model_name,
-            software_versions=metadata_config.software_versions,
-            device_serial_number=metadata_config.device_serial_number,
-            transfer_syntax_uid=transfer_syntax_uid,
-            max_fractional_value=1,
-            dimension_organization_type=dimension_organization_type,
-            omit_empty_frames=omit_empty_frames,
-        )
-        seg_time = time() - seg_start_time
-        logging.info(f"Created DICOM Segmentations in {seg_time:.1f}s.")
-    else:
-        seg_start_time = time()
-        segmentation = hd.seg.Segmentation(
-            source_images=[source_image_metadata],
-            pixel_array=segmentation_mask,
-            segmentation_type=segmentation_type,
-            segment_descriptions=[segment_description],
-            series_instance_uid=hd.UID(),
-            series_number=20,
-            sop_instance_uid=hd.UID(),
-            instance_number=1,
-            manufacturer=metadata_config.manufacturer,
-            manufacturer_model_name=metadata_config.manufacturer_model_name,
-            software_versions=metadata_config.software_versions,
-            device_serial_number=metadata_config.device_serial_number,
-            transfer_syntax_uid=transfer_syntax_uid,
-            max_fractional_value=1,
-            tile_pixel_array=True,
-            dimension_organization_type=dimension_organization_type,
-            omit_empty_frames=omit_empty_frames,
-        )
-        segmentations = [segmentation]
-        seg_time = time() - seg_start_time
-        logging.info(f"Created DICOM Segmentation in {seg_time:.1f}s.")
-
-    for seg in segmentations:
-        seg.add(metadata_config.other_trials_seq_element)
-
-    return segmentations

@@ -3,28 +3,32 @@ import pydicom
 from pydicom.sr.codedict import codes
 from pydicom.sr.coding import Code
 
-from idc_annotation_conversion.git_utils import (
-    get_git_remote_url,
-    get_git_commit_hash,
-)
-
+#from idc_annotation_conversion.git_utils import (
+#    get_git_remote_url,
+#    get_git_commit_hash,
+#)
 
 # Basic Metadata
-manufacturer = "Stony Brook University"
-manufacturer_model_name = "Pan-Cancer-Nuclei-Seg"
-software_versions = get_git_remote_url(simplify=True)
-device_serial_number = get_git_commit_hash()
+manufacturer = 'Fraunhofer MEVIS'
+manufacturer_model_name = 'BMDeep'
+software_versions = 'tbd' #get_git_remote_url(simplify=True)
+device_serial_number = 'tbd' #get_git_commit_hash()
 
-# Label description
-label = "Nuclei"
-finding_category = Code("91723000", "SCT", "Anatomical Stucture")
-finding_type = Code("84640000", "SCT", "Nucleus")
+# Labels description
+labels = ['neutrophilic_metamyelocyte']
+finding_categories = [Code('91723000', 'SCT', 'Anatomical Stucture')]
+finding_types = [Code('118957004', 'SCT', 'Normal cell')]
+labels_dict = dict(
+    label=labels, 
+    finding_category=finding_categories, 
+    finding_type=finding_types
+)
 
 # Algorithm Identification
 algorithm_identification = hd.AlgorithmIdentificationSequence(
-    name="Pan-Cancer-Nuclei-Seg",
-    version="1.0",
-    source="https://doi.org/10.7937/TCIA.2019.4A4DKP9U",
+    name='Fraunhofer MEVIS BMDeep',
+    version='1.0',
+    source='tbd',
     family=codes.cid7162.ArtificialIntelligence,
 )
 

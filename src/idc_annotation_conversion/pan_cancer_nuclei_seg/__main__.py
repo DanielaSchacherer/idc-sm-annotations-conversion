@@ -1,4 +1,4 @@
-"""Entrypoint for Pan Cancer Nuclei Segmentation annotation conversion."""
+"""Entrypoint for annotation conversion."""
 import os
 import datetime
 import pydicom 
@@ -6,33 +6,13 @@ import logging
 import pandas as pd
 from pathlib import Path
 from time import time
-from typing import Any, Dict
+from typing import Any, Dict 
 
-from idc_annotation_conversion.pan_cancer_nuclei_seg.convert import (
+from data_utils import CellAnnotation, preprocess_annotation_csvs, filter_cell_annotations
+from convert import (
     get_graphic_data,
     create_bulk_annotations,
 )
-
-ANNOTATION_PREFIX = 'cnn-nuclear-segmentations-2019/data-files/'
-
-def preprocess_annotation_csvs(cells_csv: Path, roi_csv: Path) -> pd.DataFrame: 
-    """ 
-    Function to massage the annotation data to fit the required format for the conversion process.
-    """
-
-    cells = pd.read_csv(cells_csv)
-    rois = pd.read_csv(roi_csv)
-    return pd.merge(cells, rois[['id', 'slide_id']], 
-                    left_on='rocellboxing_id', 
-                    right_on = 'id', 
-                    how='left').drop('id', axis=1)
-
-
-def filter_cell_annotations(annotations: pd.DataFrame, slide_id: str) -> pd.DataFrame: 
-    """ 
-    Function to filter for annotations of a single slide.
-    """
-    return annotations[annotations['slide_id'] == slide_id] 
 
 
 def get_source_image_metadata(slide_dir: Path) -> Dict[str, Any]: 
@@ -74,298 +54,282 @@ def get_source_image_metadata(slide_dir: Path) -> Dict[str, Any]:
     return data 
 
 
-class AnnotationParser:
+def parse_annotations(data: Dict[str, Any], annotations: pd.DataFrame) -> Dict[str, Any]: 
+    """ 
+    Parses annotations from pd.DataFrame into a list of CellAnnotations. 
 
-    """Class that parses CSV annotations to graphic data."""
+    Parameters
+    ----------
+    data: dict[str, Any]
+        Input data packed into a dict, including at least:
+        - slide_id: str
+            Slide ID for the case.
+        - source_image: pydicom.Dataset
+            Base level source image for this case.
 
-    def __init__(
-        self,
-        annotation_coordinate_type: str,
-        graphic_type: str, 
-        output_dir: Path
-    ):
-        """
+    Returns
+    -------
+    data: dict[str, Any]
+        Output data packed into a dict. This will contain the same keys as
+        the input dictionary, plus the following additional keys:
+        - ann: list[CellAnnotation]
+            List of annotations. 
+    """
 
-        Parameters
-        ----------
-        annotation_coordinate_type: str
-            Store coordinates in the Bulk Microscopy Bulk Simple Annotations in
-            the (3D) frame of reference (SCOORD3D), or the (2D) total pixel
-            matrix (SCOORD, default).
-        graphic_type: str
-            Graphic type to use to store all nuclei. Note that all but
-            'POLYGON' result in simplification and loss of information in the
-            annotations.
-        output_dir: pathlib.Path
-            A local output directory to store error logs.
+    ann = []
+    for _, row in annotations.iterrows(): 
+        x_min, y_min = row['x_in_slide'], row['y_in_slide']
+        x_max, y_max = x_min + row['cell_width'], y_min + row['cell_height']
+        ann.append(CellAnnotation(
+            identifier=row['cell_id'], 
+            bounding_box=(x_min, y_min, x_max, y_max), 
+            label=row['all_original_annotations'].split(',')[0]
+        ))
 
-        """
-        self._annotation_coordinate_type = annotation_coordinate_type
-        self._graphic_type = graphic_type
-        self._output_dir = output_dir
-        self._errors = []
+    data['ann'] = ann
+    return data
 
-    def __call__(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Parse CSV to graphic data.
 
-        Parameters
-        ----------
-        data: dict[str, Any]
-            Input data packed into a dict, including at least:
+def parse_annotations_to_graphic_data(
+    data: Dict[str, Any],
+    graphic_type: str, 
+    annotation_coordinate_type: str,
+    output_dir: Path
+    ) -> Dict[str, Any]:
 
-            - slide_id: str
-                Slide ID for the case.
-            - source_image: pydicom.Dataset
-                Base level source image for this case.
+    """
+    Parse annotations to highdicom graphic data.
 
-        Returns
-        -------
-        data: dict[str, Any]
-            Output data packed into a dict. This will contain the same keys as
-            the input dictionary, plus the following additional keys:
+    Parameters
+    ----------
+    data: dict[str, Any]
+        Input data packed into a dict, including at least:
+        - slide_id: str
+            Slide ID for the case.
+        - source_image: pydicom.Dataset
+            Base level source image for this case.
+        - ann: list[CellAnnotations]
+            List of cell annotations. 
+    graphic_type: hd.ann.GraphicTypeValues
+        Graphic type to use to store all nuclei. Allowed options are 'POLYGON' (default)
+        or 'POINT' (will be bounding box centroid). 
+    annotation_coordinate_type: hd.ann.AnnotationCoordinateTypeValues
+        Store coordinates in the Bulk Microscopy Bulk Simple Annotations in
+        the (3D) frame of reference (SCOORD3D), or the (2D) total pixel
+        matrix (SCOORD, default).
+    output_dir: pathlib.Path
+        A local output directory to store error logs.
 
-            - polygons: list[shapely.geometry.polygon.Polygon]
-                List of polygons. Note that this is always the list of full
-                original, 2D polygons regardless of the requested graphic type
-                and annotation coordinate type.
-            - graphic_data: list[np.ndarray]
-                List of graphic data as numpy arrays in the format required for
-                the MicroscopyBulkSimpleAnnotations object. These are correctly
-                formatted for the requested graphic type and annotation
-                coordinate type.
-            - identifiers: list[int]
-                Identifier for each of the polygons. The identifier is a consecutive number 
-                going over the whole dataset (not only a single slide). 
-        """
+    Returns
+    -------
+    data: dict[str, Any]
+        Output data packed into a dict. This will contain the same keys as
+        the input dictionary, plus the following additional keys:
 
-        start_time = time()
-        slide_id = data['slide_id']
-        logging.info(f'Parsing annotations for slide: {slide_id}')
-        try:
-            polygons, graphic_data, identifiers = get_graphic_data(
-                annotations='tbd',
-                source_image_metadata=data['source_image'],
-                graphic_type=self._graphic_type,
-                annotation_coordinate_type=self._annotation_coordinate_type,
-                workers=self._workers,
-            )
-        except Exception as e:
-            logging.error(f'Error {str(e)}')
-            self._errors.append(
-                {
-                    'slide_id': data['slide_id'],
-                    'error_message': str(e),
-                    'datetime': str(datetime.datetime.now()),
-                }
-            )
-            errors_df = pd.DataFrame(self._errors)
-            errors_df.to_csv(self._output_dir / 'conversion_error_log.csv')
-            return None
+        - graphic_data: list[np.ndarray]
+            List of graphic data as numpy arrays in the format required for
+            the MicroscopyBulkSimpleAnnotations object. These are correctly
+            formatted for the requested graphic type and annotation
+            coordinate type.
+        - identifiers: list[int]
+            Identifier for each of the bounding boxes. The identifier is a consecutive number 
+            going over the whole dataset (not only a single slide).
 
-        stop_time = time()
-        duration = stop_time - start_time
-        logging.info(
-            f'Processed annotations for slide {slide_id} in {duration:.2f}s'
+    """
+
+    errors = []
+    slide_id = data['slide_id']
+
+    start_time = time()
+    logging.info(f'Parsing annotations for slide: {slide_id}')
+    try:
+        graphic_data, identifiers, labels = get_graphic_data(
+            annotations=data['ann'],
+            source_image_metadata=data['source_image'],
+            graphic_type=graphic_type,
+            annotation_coordinate_type=annotation_coordinate_type,
         )
-
-        data['polygons'] = polygons
-        data['graphic_data'] = graphic_data
-        data['identifiers'] = identifiers
-        return data
-
-
-class AnnotationCreator:
-
-    """Class that creates bulk annotations DICOM objects."""
-
-    def __init__(
-        self,
-        graphic_type: str,
-        annotation_coordinate_type: str,
-        output_dir: Path
-    ):
-        """
-
-        Parameters
-        ----------
-        graphic_type: str
-            Graphic type to use to store all nuclei. Note that all but
-            'POLYGON' result in simplification and loss of information in the
-            annotations.
-        annotation_coordinate_type: str
-            Store coordinates in the Bulk Microscopy Bulk Simple Annotations in
-            the (3D) frame of reference (SCOORD3D), or the (2D) total pixel
-            matrix (SCOORD, default).
-        output_dir: pathlib.Path
-            A local output directory to store error logs.
-
-        """
-        self._annotation_coordinate_type = annotation_coordinate_type
-        self._graphic_type = graphic_type
-        self._output_dir = output_dir
-        self._errors = []
-
-
-    def __call__(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Parse CSV to graphic data.
-
-        Parameters
-        ----------
-        data: dict[str, Any]
-            Input data packed into a dict, including at least:
-
-            - slide_id: str
-                Slide ID for the case.
-            - graphic_data: list[np.ndarray]
-                List of graphic data as numpy arrays in the format required for
-                the MicroscopyBulkSimpleAnnotations object. These are correctly
-                formatted for the requested graphic type and annotation
-                coordinate type.
-            - source_image: pydicom.Dataset
-                Base level source image for this case.
-            - identifiers: list[int]
-                Identifier for each of the polygons. The identifier is a consecutive number 
-                going over the whole dataset (not only a single slide). 
-
-        Returns
-        -------
-        data: dict[str, Any]
-            Output data packed into a dict. This will contain the same keys as
-            the input dictionary, plus the following additional keys:
-
-            - ann_dcm: hd.ann.MicroscopyBulkSimpleAnnotations:
-                DICOM bulk microscopy annotation encoding the original
-                annotations in vector format.
-
-        """
-
-        # Unpack inputs
-        slide_id = data['slide_id']
-        source_image = data['source_image']
-        graphic_data = data['graphic_data']
-        identifiers = data['identifiers']
-
-        start_time = time()
-
-        logging.info(f'Creating annotation for slide: {slide_id}')
-
-        try:
-            ann_dcm = create_bulk_annotations(
-                source_image_metadata=source_image,
-                graphic_data=graphic_data,
-                identifier=identifiers,
-                annotation_coordinate_type=self._annotation_coordinate_type,
-                graphic_type=self._graphic_type,
-            )
-        except Exception as e:
-            logging.error(f"Error {str(e)}")
-            self._errors.append(
-                {
-                    'slide_id': data['slide_id'],
-                    'error_message': str(e),
-                    'datetime': str(datetime.datetime.now()),
-                }
-            )
-            errors_df = pd.DataFrame(self._errors)
-            errors_df.to_csv(self._output_dir / 'annotation_creator_error_log.csv')
-            return None
-
-        stop_time = time()
-        duration = stop_time - start_time
-        logging.info(
-            f'Created annotation for for slide {slide_id} in {duration:.2f}s'
+    except Exception as e:
+        logging.error(f'Error {str(e)}')
+        errors.append(
+            {
+                'slide_id': slide_id,
+                'error_message': str(e),
+                'datetime': str(datetime.datetime.now()),
+            }
         )
+        errors_df = pd.DataFrame(errors)
+        errors_df.to_csv(output_dir / 'conversion_error_log.txt')
+        return None
 
-        data['ann_dcm'] = ann_dcm
+    stop_time = time()
+    duration = stop_time - start_time
+    logging.info(
+        f'Processed annotations for slide {slide_id} in {duration:.2f}s'
+    )
 
-        # Save some memory
-        del data['graphic_data']
-        del data['identifiers']
+    del data['ann'] # save memory 
+    data['graphic_data'] = graphic_data
+    data['identifiers'] = identifiers
+    data['labels'] = labels
+    return data
 
-        return data
+
+def create_dcm_annotations(
+    data: Dict[str, Any],
+    graphic_type: str,
+    annotation_coordinate_type: str,
+    output_dir: Path
+    ) -> Dict[str, Any]:
+
+    """
+    Creates bulk annotations DICOM objects.
+
+    Parameters
+    ----------
+    data: dict[str, Any]
+        Input data packed into a dict, including at least:
+        - slide_id: str
+            Slide ID for the case.
+        - graphic_data: list[np.ndarray]
+            List of graphic data as numpy arrays in the format required for
+            the MicroscopyBulkSimpleAnnotations object. These are correctly
+            formatted for the requested graphic type and annotation
+            coordinate type.
+        - source_image: pydicom.Dataset
+            Base level source image for this case.
+        - identifiers: list[int]
+            Identifier for each of the bounding boxes. The identifier is a consecutive number 
+            going over the whole dataset (not only a single slide).
+        - labels: list[str]
+            Label for each bounding box. 
+    graphic_type: str
+        Graphic type to use to store all nuclei. Allowed options are 'POLYGON' (default)
+        or 'POINT'.
+    annotation_coordinate_type: str
+        Store coordinates in the Bulk Microscopy Bulk Simple Annotations in
+        the (3D) frame of reference (SCOORD3D), or the (2D) total pixel
+        matrix (SCOORD, default).
+    output_dir: pathlib.Path
+        A local output directory to store error logs.
+
+    Returns
+    -------
+    data: dict[str, Any]
+        Output data packed into a dict. This will contain the same keys as
+        the input dictionary, plus the following additional keys:
+
+        - ann_dcm: hd.ann.MicroscopyBulkSimpleAnnotations:
+            DICOM bulk microscopy annotation encoding the original
+            annotations in vector format.
+
+    """
+
+    errors = []
+    slide_id = data['slide_id']
+    start_time = time()
+    logging.info(f'Creating annotation for slide: {slide_id}')
+
+    try:
+        ann_dcm = create_bulk_annotations(
+            source_image_metadata=data['source_image'],
+            graphic_data=data['graphic_data'],
+            identifiers=data['identifiers'],
+            labels=data['labels'],
+            graphic_type=graphic_type,
+            annotation_coordinate_type=annotation_coordinate_type
+        )
+    except Exception as e:
+        logging.error(f"Error {str(e)}")
+        errors.append(
+            {
+                'slide_id': slide_id,
+                'error_message': str(e),
+                'datetime': str(datetime.datetime.now()),
+            }
+        )
+        errors_df = pd.DataFrame(errors)
+        errors_df.to_csv(output_dir / 'annotation_creator_error_log.txt')
+        return None
+
+    stop_time = time()
+    duration = stop_time - start_time
+    logging.info(
+        f'Created annotation for for slide {slide_id} in {duration:.2f}s'
+    )
+
+    
+    del data['graphic_data'] # Save some memory
+    del data['identifiers'] # Save some memory
+    del data['labels'] # Save some memory
+    data['ann_dcm'] = ann_dcm
+    return data
 
 
-class AnnotationSaver:
+def save_annotations(
+    data: dict[str, Any],
+    output_dir: Path
+    ) -> None: 
 
-    def __init__(
-        self,
-        output_dir: Path,
-    ):
-        """
+    """
+    Store files.
 
-        Parameters
-        ----------
-        output_dir: pathlib.Path
-            A local output directory to store the downloaded files.
+    Parameters
+    ----------
+    data: dict[str, Any]
+        Input data packed into a dictionary, containing at least:
 
-        """
+        - slide_id: str
+            Slide ID for the case.
+        - ann_dcm: highdicom.ann.MicroscopyBulkSimpleAnnotations
+            Bulk Annotation DICOM object.
 
-        self._output_dir = output_dir
-        self._errors = []
+    output_dir: pathlib.Path
+        A local output directory to store the downloaded files and error logs. 
+    """
+    errors = []
+    slide_id = data['slide_id']
+    
+    image_start_time = time()
+    logging.info(f'Saving annotations for slide {slide_id}')
+    
+    slide_ann_dir = output_dir / slide_id
+    slide_ann_dir.mkdir(exist_ok=True)
 
-    def __call__(
-        self,
-        data: dict[str, Any],
-    ) -> None:
-        """Store files.
+    try:
+        ann_path = f'{slide_ann_dir}/{slide_id}_ann.dcm'
+        logging.info(f'Writing annotation to {str(ann_path)}.')
+        data['ann_dcm'].save_as(ann_path)
 
-        Parameters
-        ----------
-        data: dict[str, Any]
-            Input data packed into a dictionary, containing at least:
-
-            - slide_id: str
-                Slide ID for the case.
-            - ann_dcm: highdicom.ann.MicroscopyBulkSimpleAnnotations
-                Bulk Annotation DICOM object.
-
-        """
-        image_start_time = time()
-
-        # Unpack inputs
-        slide_id = data['slide_id']
-        ann_dcm = data['ann_dcm']
-
-        logging.info(f'Saving annotations for slide {slide_id}')
+        image_stop_time = time()
+        time_for_image = image_stop_time - image_start_time
+        logging.info(
+            f'Saved annotations for slide {slide_id} in {time_for_image:.2f}s'
+        )
         
-        slide_ann_dir = self._output_dir / slide_id
-        slide_ann_dir.mkdir(exist_ok=True)
-
-        try:
-            ann_path = f'{slide_ann_dir}/{slide_id}_ann_{suffix}.dcm'
-            logging.info(f'Writing annotation to {str(ann_path)}.')
-            ann_dcm.save_as(ann_path)
-
-            image_stop_time = time()
-            time_for_image = image_stop_time - image_start_time
-            logging.info(
-                f'Saved annotations for slide {slide_id} in {time_for_image:.2f}s'
-            )
-            
-        except Exception as e:
-            logging.error(f"Error {str(e)}")
-            self._errors.append(
-                {
-                    'slide_id': data['slide_id'],
-                    'error_message': str(e),
-                    'datetime': str(datetime.datetime.now()),
-                }
-            )
-            errors_df = pd.DataFrame(self._errors)
-            errors_df.to_csv(self._output_dir / 'upload_error_log.csv')
-            return None
+    except Exception as e:
+        logging.error(f"Error {str(e)}")
+        errors.append(
+            {
+                'slide_id': slide_id,
+                'error_message': str(e),
+                'datetime': str(datetime.datetime.now()),
+            }
+        )
+        errors_df = pd.DataFrame(errors)
+        errors_df.to_csv(output_dir / 'save_error_log.txt')
+        return None
 
 
 def run(
-    csv_annotations: Path, 
+    csv_cells: Path, 
     csv_rois: Path, 
+    source_image_root_dir: Path,
     output_dir: Path,
-    graphic_type: str,
-    annotation_coordinate_type: str,
-    keep_existing: bool = False,
-    workers: int = 0,
-    pull_process: bool = True, #?
-): 
+    graphic_type: str = 'POLYGON',
+    annotation_coordinate_type: str = 'SCOORD',
+) -> None: 
+    
     logging.basicConfig(level=logging.INFO)
 
     # Suppress highdicom logging (very talkative)
@@ -375,32 +339,22 @@ def run(
     if output_dir is not None:
         output_dir.mkdir(exist_ok=True)
     
-    operations = []
-    # first collect metadata 
+    csv_cells = preprocess_annotation_csvs(csv_cells, csv_rois)
 
-    parser_kwargs = dict(
-        annotation_coordinate_type=annotation_coordinate_type,
-        graphic_type=graphic_type,
-        workers=workers,
-    )
-    operations.append((CSVParser, [], parser_kwargs))
-    annotation_creator_kwargs = dict(
-        annotation_coordinate_type=annotation_coordinate_type,
-        graphic_type=graphic_type,
-    )
-    operations.append((AnnotationCreator, [], annotation_creator_kwargs))
-    upload_kwargs = dict(
-    )
-    operations.append((FileUploader, [], upload_kwargs))
-    #pipeline = Pipeline(
-    #    operations,
-    #    same_process=not pull_process,
-    #)
-    #pipeline(to_process)
+    for slide_id in os.listdir(source_image_root_dir): 
+        slide_cells = filter_cell_annotations(csv_cells, slide_id)
+        if len(slide_cells) > 0: 
+            data = get_source_image_metadata(source_image_root_dir/slide_id)
+            data = parse_annotations(data, slide_cells)
+            data = parse_annotations_to_graphic_data(data, graphic_type, annotation_coordinate_type, output_dir)
+            data = create_dcm_annotations(data, graphic_type, annotation_coordinate_type, output_dir)
+            save_annotations(data, output_dir)
 
 
 if __name__ == "__main__":
-    sim = get_source_image_metadata(Path('/home/dschacherer/bmdeep_conversion/data/bmdeep_DICOM_converted/E2C0BE24560D78C5E599C2A9C9D0BBD2_1_bm'))
-    res = preprocess_annotation_csvs(Path('/home/dschacherer/bmdeep_conversion/data/cells.csv'),
-                               Path('/home/dschacherer/bmdeep_conversion/data/rois.csv'))
-    print(filter_cell_annotations(res, 'F7177163C833DFF4B38FC8D2872F1EC6_1_bm'))
+    data_dir = Path('/home/dschacherer/bmdeep_conversion/data/bmdeep_DICOM_converted')
+    slide_id = 'F7177163C833DFF4B38FC8D2872F1EC6_1_bm'
+    cell_csv = Path('/home/dschacherer/bmdeep_conversion/data/cells.csv')
+    roi_csv = Path('/home/dschacherer/bmdeep_conversion/data/rois.csv')
+    run(cell_csv, roi_csv, data_dir, data_dir)
+
